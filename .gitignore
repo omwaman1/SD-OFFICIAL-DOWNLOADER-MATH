@@ -1,0 +1,13 @@
+# Large binaries
+ffmpeg.exe
+
+# Runtime generated
+downloads/
+temp/
+video_index.json
+download_log.json
+__pycache__/
+*.pyc
+
+# Device keys (sensitive)
+device.wvd
