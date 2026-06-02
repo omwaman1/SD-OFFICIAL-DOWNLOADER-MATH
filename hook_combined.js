@@ -2,8 +2,10 @@
 // Strategy: Replace getKeyRequest challenge with ours, capture provideKeyResponse
 Java.perform(function () {
     // =============================================
-    // PART 1: USB DEBUGGING BYPASS
+    // PART 1: USB DEBUGGING / DEVELOPER MODE BYPASS
     // =============================================
+
+    // --- Settings.Secure / Settings.Global ---
     var S = Java.use("android.provider.Settings$Secure");
     S.getInt.overload("android.content.ContentResolver", "java.lang.String", "int").implementation = function (a, b, c) {
         if (b === "adb_enabled" || b === "development_settings_enabled") return 0;
@@ -30,9 +32,122 @@ Java.perform(function () {
         if (b === "adb_enabled" || b === "development_settings_enabled") return "0";
         return this.getString(a, b);
     };
+
+    // --- Debug class ---
     var D = Java.use("android.os.Debug");
     D.isDebuggerConnected.implementation = function () { return false; };
-    console.log("[+] USB bypass active");
+
+    // --- Build properties (ro.debuggable, userdebug, etc.) ---
+    try {
+        var Build = Java.use("android.os.Build");
+        Build.TYPE.value = "user";
+        Build.TAGS.value = "release-keys";
+    } catch(e) {}
+
+    // --- SystemProperties (ro.debuggable, ro.secure, etc.) ---
+    try {
+        var SP = Java.use("android.os.SystemProperties");
+        SP.get.overload("java.lang.String", "java.lang.String").implementation = function(key, def) {
+            if (key === "ro.debuggable") return "0";
+            if (key === "ro.secure") return "1";
+            if (key === "service.adb.root") return "0";
+            return this.get(key, def);
+        };
+        SP.get.overload("java.lang.String").implementation = function(key) {
+            if (key === "ro.debuggable") return "0";
+            if (key === "ro.secure") return "1";
+            if (key === "service.adb.root") return "0";
+            return this.get(key);
+        };
+        try {
+            SP.getBoolean.overload("java.lang.String", "boolean").implementation = function(key, def) {
+                if (key === "ro.debuggable") return false;
+                return this.getBoolean(key, def);
+            };
+        } catch(e2) {}
+    } catch(e) {}
+
+    // --- USB Manager (detect USB connected) ---
+    try {
+        var UsbManager = Java.use("android.hardware.usb.UsbManager");
+        UsbManager.getAccessoryList.implementation = function () { return null; };
+    } catch(e) {}
+
+    // --- BatteryManager (USB charging state can reveal USB connection) ---
+    try {
+        var IntentFilter = Java.use("android.content.IntentFilter");
+        var BatteryManager = Java.use("android.os.BatteryManager");
+        var Intent = Java.use("android.content.Intent");
+        Intent.getIntExtra.overload("java.lang.String", "int").implementation = function(name, def) {
+            if (name === "plugged") {
+                // Return AC charging (2) instead of USB (1)
+                var val = this.getIntExtra(name, def);
+                if (val === 2) return 1;  // USB → return AC
+                return val;
+            }
+            return this.getIntExtra(name, def);
+        };
+    } catch(e) {}
+
+
+    console.log("[+] USB/Developer bypass active (comprehensive)");
+
+    // =============================================
+    // DEBUG: Catch ExoPlayer / Player errors
+    // =============================================
+    try {
+        // Hook Toast to catch any error messages shown
+        var Toast = Java.use("android.widget.Toast");
+        Toast.show.implementation = function() {
+            try {
+                // Get the toast text
+                var view = this.getView();
+                if (view) {
+                    var tv = Java.cast(view, Java.use("android.view.ViewGroup")).getChildAt(0);
+                    if (tv) {
+                        var text = Java.cast(tv, Java.use("android.widget.TextView")).getText().toString();
+                        console.log("[TOAST] " + text);
+                    }
+                }
+            } catch(e) {
+                console.log("[TOAST] (could not read text)");
+            }
+            return this.show();
+        };
+    } catch(e) {}
+
+    try {
+        // Hook AlertDialog to catch any popup error messages
+        var AlertBuilder = Java.use("android.app.AlertDialog$Builder");
+        AlertBuilder.setMessage.overload("java.lang.CharSequence").implementation = function(msg) {
+            console.log("[ALERT] " + msg);
+            return this.setMessage(msg);
+        };
+    } catch(e) {}
+
+    // Log ALL exceptions thrown to find silent failures
+    try {
+        var Throwable = Java.use("java.lang.Throwable");
+        Throwable.$init.overload("java.lang.String").implementation = function(msg) {
+            if (msg && (
+                msg.indexOf("drm") !== -1 || msg.indexOf("DRM") !== -1 ||
+                msg.indexOf("player") !== -1 || msg.indexOf("Player") !== -1 ||
+                msg.indexOf("Exo") !== -1 || msg.indexOf("exo") !== -1 ||
+                msg.indexOf("video") !== -1 || msg.indexOf("Video") !== -1 ||
+                msg.indexOf("developer") !== -1 || msg.indexOf("Developer") !== -1 ||
+                msg.indexOf("debug") !== -1 || msg.indexOf("Debug") !== -1 ||
+                msg.indexOf("USB") !== -1 || msg.indexOf("usb") !== -1 ||
+                msg.indexOf("security") !== -1 || msg.indexOf("Security") !== -1 ||
+                msg.indexOf("license") !== -1 || msg.indexOf("License") !== -1 ||
+                msg.indexOf("blocked") !== -1 || msg.indexOf("denied") !== -1 ||
+                msg.indexOf("not allowed") !== -1 || msg.indexOf("restrict") !== -1
+            )) {
+                console.log("[EXCEPTION] " + msg);
+                console.log("[EXCEPTION-STACK] " + Java.use("android.util.Log").getStackTraceString(this));
+            }
+            return this.$init(msg);
+        };
+    } catch(e) {}
 
     // =============================================
     // PART 2: STORAGE
@@ -192,7 +307,7 @@ Java.perform(function () {
             console.log("[PARAM-2 encKey]   " + b);
             console.log("======================================\n");
             storeVideoUrl(a, "oa.n0.Jb");
-            this.Jb(a, b, c, d);
+            return this.Jb(a, b, c, d);
         };
         console.log("[+] Hooked oa.n0.Jb");
     } catch (e) { console.log("[!] oa.n0.Jb hook failed: " + e); }
