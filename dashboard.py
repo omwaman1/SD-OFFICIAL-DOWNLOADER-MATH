@@ -14,6 +14,7 @@ Usage:
 """
 import os, sys, re, json, time, base64, subprocess, threading, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 import requests as req_lib
 
 BRIDGE = "http://127.0.0.1:8899"
@@ -73,17 +74,112 @@ class DownloadManager:
         }
 
     def get_video_urls(self, vid_key):
-        """Get fresh MPD URL for a video using its encrypted content ID."""
-        # Look up content ID from video index
-        index = load_index()
-        info = index.get(vid_key, {})
+        """Get video + audio track URLs. Uses direct CDN URLs when possible."""
+        keys_db = load_keys_db()
+        info = keys_db.get(vid_key, {})
 
-        # Try to find the encrypted content ID by looking through course content
+        # 1. FASTEST: Use stored track URL from capture
+        stored_track = info.get("track_url") or ""
+        stored_mpd = info.get("mpd_url") or ""
+        if stored_track and "_video_" in stored_track:
+            video_url, audio_url = self._derive_tracks(stored_track)
+            if video_url and audio_url:
+                return video_url, audio_url, None
+
+        # 1b. Use stored MPD URL directly
+        if stored_mpd and ".mpd" in stored_mpd:
+            return stored_mpd, None, "mpd"
+
+        # 2. FAST: Try CDN pattern directly (no auth needed for DRM tracks)
+        video_url, audio_url = self._probe_cdn_tracks(vid_key)
+        if video_url and audio_url:
+            return video_url, audio_url, None
+
+        # 3. MEDIUM: Use bridge /video-url endpoint
+        try:
+            r = req_lib.get(f"{BRIDGE}/video-url?id={vid_key}", timeout=15)
+            data = r.json()
+            mpd_url = data.get("drmUrls", {}).get("manifestUrl")
+            if mpd_url:
+                return mpd_url, None, "mpd"
+        except:
+            pass
+
+        # 4. SLOW FALLBACK: Scan course folders
+        mpd, _, _ = self._scan_folders_for_vid(vid_key)
+        if mpd:
+            return mpd, None, "mpd"
+        return None, None, None
+
+    def _derive_tracks(self, track_url, quality="720"):
+        """Derive video + audio URLs from a known track URL."""
+        # Pattern: .../hash_video_720_enc.mp4 → .../hash_audio_enc.mp4
+        m = re.search(r"^(.*/)([a-f0-9]+)_video_\d+_enc\.mp4", track_url)
+        if m:
+            base, h = m.group(1), m.group(2)
+            video_url = f"{base}{h}_video_{quality}_enc.mp4"
+            audio_url = f"{base}{h}_audio_enc.mp4"
+            # Verify video exists at this quality, fallback to others
+            try:
+                r = req_lib.head(video_url, timeout=5)
+                if r.status_code != 200:
+                    for q in ["720", "480", "360"]:
+                        alt = f"{base}{h}_video_{q}_enc.mp4"
+                        r = req_lib.head(alt, timeout=5)
+                        if r.status_code == 200:
+                            video_url = alt
+                            break
+            except:
+                pass
+            return video_url, audio_url
+        return None, None
+
+    def _probe_cdn_tracks(self, vid_key):
+        """Try to find track URLs on CDN by probing known URL patterns."""
+        # Try captured URLs from bridge
+        try:
+            r = req_lib.get(f"{BRIDGE}/captured-urls", timeout=5).json()
+            for entry in r.get("urls", []):
+                u = entry.get("url", "")
+                if vid_key in u and "_video_" in u:
+                    return self._derive_tracks(u)
+        except:
+            pass
+        return None, None
+
+    def _get_fresh_mpd(self, vid_key):
+        """Get a fresh signed MPD URL for a vidKey by searching course content."""
+        token = self.get_token()
+        if not token:
+            return None
+        # Quick search: try root and common folder patterns
+        folders = [(None, "")]
+        visited = 0
+        while folders and visited < 100:  # limit to prevent infinite scan
+            fid, path = folders.pop(0)
+            visited += 1
+            url = f"{API}/v2/course/content/get?courseId={DEFAULT_COURSE}&storeContentEvent=false"
+            if fid:
+                url += f"&folderId={fid}"
+            try:
+                r = req_lib.get(url, headers=self.api_headers(), timeout=10)
+                items = r.json().get("data", {}).get("courseContent", [])
+                for item in items:
+                    if item.get("contentType") == 1:
+                        folders.append((item.get("id"), ""))
+                    elif item.get("vidKey") == vid_key:
+                        enc_id = item.get("encryptedContentId", item.get("contentId"))
+                        if enc_id:
+                            return self._get_drm_url(enc_id)
+            except:
+                pass
+        return None
+
+    def _scan_folders_for_vid(self, vid_key):
+        """Slow fallback: scan all course folders for a vidKey."""
         token = self.get_token()
         if not token:
             return None, None, None
-
-        # Search course content for this vidKey to get encrypted contentId
         folders = [(None, "")]
         while folders:
             fid, path = folders.pop(0)
@@ -99,23 +195,22 @@ class DownloadManager:
                     elif item.get("vidKey") == vid_key:
                         enc_id = item.get("encryptedContentId", item.get("contentId"))
                         if enc_id:
-                            return self._get_drm_urls(enc_id)
+                            mpd = self._get_drm_url(enc_id)
+                            if mpd:
+                                return mpd, None, None
             except:
                 pass
         return None, None, None
 
-    def _get_drm_urls(self, enc_id):
+    def _get_drm_url(self, enc_id):
         """Get MPD URL from encrypted content ID."""
         enc = urllib.parse.quote(str(enc_id))
         url = f"{API}/cams/uploader/video/jw-signed-url?contentId={enc}&offlineDownload=false"
         try:
             r = req_lib.get(url, headers=self.api_headers(), timeout=15).json()
-            mpd_url = r.get("drmUrls", {}).get("manifestUrl")
-            if mpd_url:
-                return mpd_url, None, None
+            return r.get("drmUrls", {}).get("manifestUrl")
         except:
-            pass
-        return None, None, None
+            return None
 
     def get_tracks_from_mpd(self, mpd_url, quality="720"):
         """Get video and audio track URLs from MPD."""
@@ -269,12 +364,14 @@ class DownloadManager:
             self.cancel_flags[vid_key] = cancel_event
 
         try:
-            # Get fresh MPD URL
+            # Get video + audio URLs
             with self.lock:
                 self.active[vid_key]["phase"] = "fetching video URL..."
 
-            mpd_url, _, _ = self.get_video_urls(vid_key)
-            if not mpd_url:
+            result = self.get_video_urls(vid_key)
+            url_a, url_b, mode = result[0], result[1], result[2] if len(result) > 2 else None
+
+            if not url_a:
                 with self.lock:
                     self.active[vid_key]["phase"] = "❌ Could not get video URL"
                 time.sleep(3)
@@ -282,7 +379,13 @@ class DownloadManager:
 
             if cancel_event.is_set(): return
 
-            video_url, audio_url = self.get_tracks_from_mpd(mpd_url)
+            # If we got direct track URLs, use them; otherwise parse MPD
+            if url_b and mode != "mpd":
+                video_url, audio_url = url_a, url_b
+            else:
+                mpd_url = url_a
+                video_url, audio_url = self.get_tracks_from_mpd(mpd_url)
+
             if not video_url or not audio_url:
                 with self.lock:
                     self.active[vid_key]["phase"] = "❌ Missing tracks"
@@ -334,7 +437,7 @@ class DownloadManager:
             out_path = os.path.join(out_dir, f"{name}.mp4")
 
             subprocess.run(["ffmpeg", "-y", "-i", v_dec, "-i", a_dec,
-                             "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart",
+                             "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart",
                              out_path], capture_output=True)
 
             # Cleanup temp
@@ -428,12 +531,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass  # Suppress access logs
 
     def _send_json(self, data, status=200):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass  # Browser closed connection, harmless
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -513,7 +619,9 @@ def main():
     except:
         print("  ⚠️  Bridge not running — downloads won't work until bridge is started")
 
-    server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
+    class ThreadedServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+    server = ThreadedServer(("0.0.0.0", PORT), DashboardHandler)
     print(f"\n  🌐 Dashboard: http://localhost:{PORT}")
     print(f"  Press Ctrl+C to stop\n")
 

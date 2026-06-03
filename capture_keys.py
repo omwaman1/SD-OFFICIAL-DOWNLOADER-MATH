@@ -133,22 +133,27 @@ def main():
             print(f"{'=' * 60}")
             print(f"  ⏳ Waiting for video...")
 
-            # Wait for MPD
-            mpd_url = None
-            while not mpd_url:
+            # Wait for video URL (MPD or direct track)
+            vid_url = None
+            track_url = None
+            while not vid_url:
                 time.sleep(2)
                 try:
                     cap = requests.get(f"{BRIDGE}/captured-urls", timeout=5).json()
                     for entry in cap.get("urls", []):
                         u = entry.get("url", "")
                         if ".mpd" in u:
-                            mpd_url = u
+                            vid_url = u
+                            break
+                        elif "_video_" in u and "/drm/wv/" in u:
+                            vid_url = u
+                            track_url = u
                             break
                 except:
                     pass
 
-            # Find video info
-            m = re.search(r"/drm/wv/([a-f0-9]+)/", mpd_url)
+            # Find video info from URL
+            m = re.search(r"/drm/(?:wv/)?([a-f0-9]+)/", vid_url)
             vid_key = m.group(1) if m else None
             info = index.get(vid_key, {}) if vid_key else {}
             vid_name = info.get("name", f"Unknown ({vid_key[:12]})" if vid_key else "Unknown")
@@ -166,7 +171,7 @@ def main():
                 continue
 
             # Get PSSH
-            mpd_text = requests.get(mpd_url, timeout=15).text
+            mpd_text = requests.get(vid_url, timeout=15).text
             pssh_m = re.search(r"<cenc:pssh>(.*?)</cenc:pssh>", mpd_text)
             if not pssh_m:
                 print("     ❌ No PSSH"); continue
@@ -232,6 +237,8 @@ def main():
                 "duration": vid_duration,
                 "folder": vid_folder,
                 "keys": keys,
+                "mpd_url": vid_url,
+                "track_url": track_url or "",
                 "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             save_keys_db(keys_db)
